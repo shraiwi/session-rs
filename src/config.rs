@@ -1,6 +1,8 @@
 use crate::{fingerprint::FeatureExtractorConfiguration, search::DatabaseConfiguration};
+use serde::Deserialize;
 
-
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionConfiguration {
     // feature extractor
     pub sample_rate: usize,
@@ -48,7 +50,7 @@ impl Default for SessionConfiguration {
             quantizer_bits_per_bin: 5,
             quantizer_topk: 8,
 
-            search_beam_count: 1000,
+            search_beam_count: 100,
             search_window_size: 3,
             search_nonmax_overlap: 1.0,
             search_length_penalty: 3,

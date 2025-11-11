@@ -134,7 +134,7 @@ impl FeatureExtractor {
         })
     }
 
-    pub fn features(&self, audio: Vec<i16>) -> Vec<Feature> {
+    pub fn features(&self, audio: &[f32]) -> Vec<Feature> {
         let cfg = &self.cfg;
 
         // build spectogram of audio
@@ -142,11 +142,6 @@ impl FeatureExtractor {
         let mut input = self.fft.make_input_vec();
         let mut output = self.fft.make_output_vec();
         let mut scratch = self.fft.make_scratch_vec();
-
-        let audio: Vec<f32> = audio
-            .iter()
-            .map(|s| (*s as f32) * 2f32.powi(-15) )
-            .collect();
 
         let windows = audio
             .windows(cfg.window_size)
@@ -221,8 +216,8 @@ mod tests {
         println!("WAV spec: {:?}", spec);
 
         // Read samples as i16
-        let samples: Vec<i16> = reader.samples::<i16>()
-            .map(|s| s.expect("Failed to read sample"))
+        let samples: Vec<f32> = reader.samples::<i16>()
+            .map(|s| s.expect("Failed to read sample") as f32 / i16::MAX as f32)
             .collect();
 
         println!("Read {} samples", samples.len());
@@ -232,7 +227,7 @@ mod tests {
         let extractor: FeatureExtractor = config.into();
 
         // Extract features
-        let features = extractor.features(samples);
+        let features = extractor.features(&samples);
 
         println!("Extracted {} features", features.len());
 

@@ -1,7 +1,8 @@
 use crate::{config::SessionConfiguration, fingerprint::Feature};
 
-use std::collections::{BinaryHeap, HashMap};
+use std::{cmp::Ordering, collections::{BinaryHeap, HashMap, hash_map::Entry::{Occupied, Vacant}}};
 use uuid::Uuid;
+use serde::{Serialize, Deserialize};
 
 pub struct DatabaseConfiguration {
     sample_rate: usize,
@@ -36,156 +37,207 @@ impl From<&SessionConfiguration> for DatabaseConfiguration {
     }
 }
 
-struct QueryResult {
-    score: f32, 
-    uuid: Uuid, 
-    start: usize, 
-    end: usize,
-    query_start: usize,
+pub struct QueryResult {
+    pub uuid: Uuid,
+    pub score: f32, 
+    pub key_start: usize, 
+    pub key_end: usize,
+    pub query_start: usize,
 }
 
-impl<'a> From<Beam<'a>> for QueryResult {
-    fn from(beam: Beam<'a>) -> Self {
-        Self {
-            score: beam.score(), 
-            uuid: *beam.src.0, 
-            start: beam.start(), 
-            end: beam.end(),
-            query_start: beam.query_start
-        }
-    }
+struct Fraction { n: u32, d: u32 }
+
+impl Fraction {
+    pub fn to_f32(&self) -> f32 { self.n as f32 / self.d as f32 }
 }
 
-struct Beam<'a> {
-    src: (&'a Uuid, &'a [Feature]),
-
-    path: Vec<usize>,
-    score_frac: (u32, u32),
-    query_start: usize,
-}
-
-impl<'a> PartialEq for Beam<'a> {
+impl PartialEq for Fraction {
     fn eq(&self, other: &Self) -> bool {
-        self.score_frac.0 * other.score_frac.1 == other.score_frac.0 * self.score_frac.1
+        self.n * other.d == other.n * self.d
     }
 }
-impl<'a> Eq for Beam<'a> {}
-impl<'a> PartialOrd for Beam<'a> {
+impl Eq for Fraction {}
+impl PartialOrd for Fraction {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl<'a> Ord for Beam<'a> {
-    // we want the first item to be the highest scoring (worst) one
+impl Ord for Fraction {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let selfscore = self.score_frac.0 * other.score_frac.1;
-        let otherscore = other.score_frac.0 * self.score_frac.1;
+        let selfscore = self.n * other.d;
+        let otherscore = other.n * self.d;
         selfscore.cmp(&otherscore)
     }
 }
 
-impl<'a> Beam<'a> {
-    pub fn score(&self) -> f32 {
-        self.score_frac.0 as f32 / self.score_frac.1 as f32
-    }
-
-    pub fn start(&self) -> usize { *self.path.first().unwrap() }
-    pub fn end(&self) -> usize { *self.path.last().unwrap() }
-
-    pub fn push(&mut self, distance: u32, index: usize) {
-        self.path.push(index);
-        self.score_frac.0 += distance;
-        self.score_frac.1 += 1;
-    }
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Beam {
+    query_start: usize,
+    path: Vec<usize>,
 }
 
-struct Database {
+impl Beam {
+    fn key_start(&self) -> usize { *self.path.first().unwrap() }
+    fn key_end(&self) -> usize { *self.path.last().unwrap() }
+}
+
+
+pub struct Query<'a> {
+    database: &'a Database,
+    head: usize,
+    song_beams: Vec<(&'a Uuid, &'a [Feature], Vec<(Fraction, Beam)>)>,
+}
+
+pub struct Database {
     cfg: DatabaseConfiguration,
     database: HashMap<Uuid, Vec<Feature>>
 }
 
-struct Query<'a> {
-    beams: BinaryHeap<Beam<'a>>,
-    head: usize,
-    database: &'a Database,
-}
 
 impl Database {
-    pub fn register(&mut self, features: Vec<Feature>) -> Uuid {
-        let key = Uuid::new_v4();
-        self.database.insert(key.clone(), features);
-        key
+    pub fn insert(&mut self, key: Uuid, features: Vec<Feature>) {
+        self.database.insert(key, features);
     }
 
     pub fn new_query<'a>(&'a self) -> Query<'a> {
-        Query { beams: BinaryHeap::with_capacity(self.cfg.search_beam_count), database: self, head: 0 }
+        let beams = self.database
+            .iter()
+            .map(|(uuid, features)|
+                (uuid, features.as_slice(), Vec::with_capacity(self.cfg.search_beam_count)))
+            .collect();
+
+        Query { song_beams: beams, database: self, head: 0 }
+    }
+}
+
+impl From<DatabaseConfiguration> for Database {
+    fn from(cfg: DatabaseConfiguration) -> Self {
+        Self { cfg, database: HashMap::new() }
     }
 }
 
 impl<'a> Query<'a> {
+
     pub fn update(&mut self, new_feature: Feature) {
-        let cfg = &self.database.cfg;
 
-        // search through exisiting beams
-        let mut new_beams = BinaryHeap::new();
-
-        // timewarp existing beams, update score
-        while let Some(mut beam) = self.beams.pop() {
-            let head = beam.end();
-
-            // search for new head based on feature
-            let (_, features) = &beam.src;
-
-            let start = head+1;
-            let end = (start+cfg.search_window_size).min(features.len());
-
-            let min = features[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, cand_feature)| 
-                    (offset, cand_feature.distance(&new_feature)))
-                .min_by_key(|item| item.1);
-
-            if let Some((offset, distance)) = min {
-                beam.push(distance, start+offset);
-
-                //worst_mean_distance = worst_mean_distance.max(beam.mean_distance());
-
-                new_beams.push(beam);
-            }
+        // allows us to lazily allocate a new beam
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Candidate {
+            Existing(Beam),
+            Seed(usize)
         }
 
-        // search to seed new beams
-        //let mut cand_beams = BinaryHeap::new();
-
-        for (uuid, features) in &self.database.database {
-            for (head, feature) in features.iter().enumerate() {
-                let distance = new_feature.distance(feature);
-
-                let beam = Beam {
-                    src: (uuid, features),
-                    path: vec![head],
-                    score_frac: (cfg.search_score_penalty + distance,
-                        cfg.search_length_penalty + 1),
-                    query_start: self.head
-                };
-
-                if new_beams.len() < cfg.search_beam_count {
-                    new_beams.push(beam);
-                } else if beam.cmp(new_beams.peek().unwrap()) == std::cmp::Ordering::Less {
-                    // add this new beam if it's better than the worst beam in the set.
-                    new_beams.pop();
-                    new_beams.push(beam);
+        impl Candidate {
+            fn to_beam(self, query_start: usize) -> Beam {
+                match self {
+                    Self::Existing(beam) => beam,
+                    Self::Seed(key_start) => Beam { query_start, path: vec![key_start] }
                 }
             }
         }
 
+        let cfg = &self.database.cfg;
+
+        /*
+        for each song, timewarp existing beams and seed new ones using the new feature.
+        perform automatic merging/matching  of songs using end/start tables
+        */
+
+        for (uuid, features, beams) in self.song_beams.iter_mut() {
+
+            // seed recombination table
+            let scores: Vec<u32> = features
+                .iter()
+                .map(|key_feature| new_feature.distance(key_feature))
+                .collect();
+
+            let mut recomb_table: HashMap<usize, (Fraction, Candidate)> = HashMap::new();
+
+            // combine with existing beams
+            for (mut score, mut beam) in beams.drain(..) { // get beam
+
+                // extend beam
+
+                let head = beam.key_end();
+
+                let start = head+1;
+                let end = (start+cfg.search_window_size).min(scores.len());
+
+                let min = scores[start..end]
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, &d)| d);
+
+                if let Some((offset, distance)) = min {
+                    beam.path.push(start + offset);
+                    score.n += distance;
+                    score.d += 1;
+                }
+                
+                let entry = recomb_table.entry(beam.key_end());
+
+                match entry {
+                    Vacant(entry) => { entry.insert((score, Candidate::Existing(beam))); }
+                    Occupied(entry) => { // presumably the entry is another competing beam
+                        let (other_score, other_beam) = entry.into_mut();
+
+                        if score.cmp(other_score) == Ordering::Less { // if this beam is stronger, insert
+                            *other_score = score;
+                            *other_beam = Candidate::Existing(beam);
+                        }
+                    }
+                }
+            }
+
+            // seed new beams
+            for (key_start, distance) in scores.into_iter().enumerate() {
+                let score = Fraction { n: cfg.search_score_penalty + distance, d: cfg.search_length_penalty + 1 };
+
+                let entry = recomb_table.entry(key_start);
+
+                match entry {
+                    Vacant(entry) => { entry.insert((score, Candidate::Seed(key_start))); }
+                    Occupied(entry) => { // presumably the entry is another competing beam
+                        let (other_score, other_beam) = entry.into_mut();
+
+                        if score.cmp(other_score) == Ordering::Less { // if this beam is stronger, insert
+                            *other_score = score;
+                            *other_beam = Candidate::Seed(key_start);
+                        }
+                    }
+                }
+            }
+
+            let mut heap: BinaryHeap<_> = recomb_table
+                .into_values()
+                .collect();
+
+            // trim heap size, removing high scoring elements until size is OK.
+            while heap.len() > cfg.search_beam_count { heap.pop(); }
+
+            // convert hashmap into maxheap
+            *beams = heap
+                .drain()
+                .map(|(score, cand)| (score, cand.to_beam(self.head)))
+                .collect();
+        }
+        
         self.head += 1;
-        self.beams = new_beams;
     }
 
     pub fn finalize(self) -> Vec<QueryResult> {
-        let mut beams = self.beams.into_sorted_vec();
+        // get minheap
+        let mut heap: BinaryHeap<(Fraction, &Uuid, Beam)> = self.song_beams
+            .into_iter()
+            .flat_map(|(uuid, _, beams)| beams
+                .into_iter()
+                .map(move |(score, beam)| (score, uuid, beam)))
+            .collect();
+
+        /*
+
+
+        let mut beams = self.song_beams.into_sorted_vec();
         beams.reverse();
 
         let mut results = Vec::new();
@@ -208,7 +260,22 @@ impl<'a> Query<'a> {
             results.push(beam.into());
         }
 
-        results
+        results*/
+
+        let beams: Vec<_> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(score, uuid, beam)| QueryResult { 
+                uuid: *uuid, 
+                score: score.to_f32(), 
+                key_start: beam.key_start(),
+                key_end: beam.key_end(),
+                query_start: beam.query_start
+            })
+            .collect();
+        //beams.reverse();
+
+        beams
     }
 }
 
@@ -219,6 +286,7 @@ mod tests {
     use crate::{config::SessionConfiguration, fingerprint::FeatureExtractor};
     use std::path::Path;
     use std::time::Instant;
+    use url::Url;
 
     fn resample(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         if from_rate == to_rate {
@@ -275,7 +343,9 @@ mod tests {
             samples
         };
 
-        extractor.features(resampled)
+        let converted: Vec<f32> = resampled.into_iter().map(|f| f as f32 / i16::MAX as f32).collect();
+
+        extractor.features(&converted)
     }
 
     #[test]
@@ -311,7 +381,8 @@ mod tests {
                 println!("Loading key file: {}", file);
                 let features = load_wav_features(path.to_str().unwrap(), &extractor, target_sample_rate);
                 println!("  Extracted {} features", features.len());
-                let uuid = database.register(features);
+                let uuid = Uuid::new_v4();
+                database.insert(uuid, features);
                 registry.insert(uuid, path);
             }
         }
@@ -336,13 +407,14 @@ mod tests {
 
         println!("\nFound {} matches in {:?}:", results.len(), end - start);
         for (i, result) in results.iter().enumerate() {
-            println!("  Match {}: score={}, path={:?} from={}, {}s - {}s",
+            let path = registry.get(&result.uuid).unwrap().canonicalize().unwrap();
+            println!("  Match {}: score={}, from={:.2}s, to={}#t={:.2},{:.2} ",
                 i + 1, 
                 result.score,
-                registry.get(&result.uuid).unwrap(), 
                 result.query_start as f32 * config.stride_dt(),
-                result.start as f32 * config.stride_dt(), 
-                (result.end + 1) as f32 * config.stride_dt());
+                Url::from_file_path(path).unwrap(), 
+                result.key_start as f32 * config.stride_dt(), 
+                (result.key_end + 1) as f32 * config.stride_dt());
         }
 
         // Verify we got at least one result
