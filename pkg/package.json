@@ -1,0 +1,14 @@
+{
+  "name": "session-rs",
+  "version": "0.1.0",
+  "files": [
+    "session_rs_bg.wasm",
+    "session_rs.js",
+    "session_rs.d.ts"
+  ],
+  "module": "session_rs.js",
+  "types": "session_rs.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
