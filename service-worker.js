@@ -101,6 +101,12 @@ async function initializeSession() {
   }
 }
 
+// Install event - skip waiting to activate immediately
+self.addEventListener('install', (event) => {
+  console.log('Service worker installing...');
+  self.skipWaiting();
+});
+
 // Convert Float32Array to WAV format
 function createWavBlob(audioData, sampleRate = 44100) {
   const numChannels = 1;
@@ -424,7 +430,18 @@ async function handleSearch(request) {
 
 // Initialize on service worker activation
 self.addEventListener('activate', (event) => {
-  event.waitUntil(initializeSession());
+  console.log('Service worker activating...');
+  event.waitUntil(
+    (async () => {
+      // Take control of all clients immediately
+      await self.clients.claim();
+      console.log('Service worker claimed clients');
+
+      // Initialize session
+      await initializeSession();
+      console.log('Service worker fully initialized');
+    })()
+  );
 });
 
 // Initialize immediately if already active
